@@ -13,12 +13,13 @@ Strategy (robust against minifier renames and reordering):
   1. Locate the parseAutoModeEnabledState function by searching for
      the unique string literal "opt-in" (only used in auto mode context)
      combined with the function's return-default pattern.
-  2. Extract the default-variable name from `return VARNAME}`.
+  2. Extract the default-variable name from the matched pattern.
   3. Find the declaration  VARNAME="disabled";  and patch it to
      VARNAME="enabled";  with a 1-byte space pad to keep binary size.
 
   Multiple regex strategies are tried in order to handle variations
-  across platforms (different comparison orders, different minifier output).
+  across platforms (different comparison orders, ternary vs if/return,
+  different minifier output).
 """
 
 import re
@@ -40,11 +41,17 @@ def sha256(data: bytes) -> str:
 # The three string literals "enabled", "disabled", "opt-in" are application
 # constants that survive minification.  The variable/function names change
 # per-platform build.
+#
+# Two function forms exist across platforms:
+#   A) if/return/return:  if(...)return Y;return DEFAULT}
+#   B) ternary:           ...?Y:DEFAULT}  or  return ...?Y:DEFAULT
 
 _Q = rb'''(?:"|')'''  # quote (single or double)
 
 _STRATEGIES = [
-    # ── Strategy 1: full function, standard order ────────────────
+    # ── A. if/return/return patterns ─────────────────────────────
+
+    # A1: full function, standard order
     # function Xx(Y){if(Y==="enabled"||Y==="disabled"||Y==="opt-in")return Y;return Zz}
     re.compile(
         rb'function \w+\(\w+\)\{'
@@ -54,35 +61,75 @@ _STRATEGIES = [
         + rb'\)return \w+;return (\w+)\}'
     ),
 
-    # ── Strategy 2: any order — just anchor on "opt-in" at end ───
-    # ...||Y==="opt-in")return Y;return Zz}
+    # A2: "opt-in" at end of comparisons
     re.compile(
         _Q + rb'opt-in' + _Q + rb'\)return \w+;return (\w+)\}'
     ),
 
-    # ── Strategy 3: "opt-in" in the middle ───────────────────────
-    # ...||Y==="opt-in"||...  )return Y;return Zz}
+    # A3: "opt-in" in middle
     re.compile(
         _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,120}return \w+;return (\w+)\}'
     ),
 
-    # ── Strategy 4: "opt-in" at the start ────────────────────────
-    # if(Y==="opt-in"||...)return Y;return Zz}
+    # A4: "opt-in" at start
     re.compile(
         rb'if\(\w+===' + _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,200}return \w+;return (\w+)\}'
     ),
 
-    # ── Strategy 5: very loose — "opt-in" near a double-return ───
-    # Looks for "opt-in" within 300 bytes before `return X;return Y}`
+    # A5: loose - "opt-in" within 300 bytes of double-return
     re.compile(
         _Q + rb'opt-in' + _Q + rb'[^}]{0,300}return \w+;return (\w+)\}'
+    ),
+
+    # ── B. Ternary patterns ──────────────────────────────────────
+    # These match when minifier uses  ...?Y:DEFAULT  instead of
+    # if(...)return Y;return DEFAULT
+
+    # B1: "opt-in" at end of comparisons, ternary
+    # ...||Y==="opt-in"?Y:Zz}   or   ...||Y==="opt-in"?Y:Zz;
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'\?\w+:(\w+)[};,)]'
+    ),
+
+    # B2: "opt-in" in middle, ternary
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,120}\?\w+:(\w+)[};,)]'
+    ),
+
+    # B3: "opt-in" at start, ternary
+    re.compile(
+        rb'\w+===' + _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,200}\?\w+:(\w+)[};,)]'
+    ),
+
+    # B4: loose - "opt-in" within 300 bytes of ternary
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'[^}]{0,300}\?\w+:(\w+)\}'
+    ),
+
+    # ── C. Reversed comparison patterns ──────────────────────────
+    # "opt-in"===Y  (value on left side of ===)
+
+    # C1: reversed + if/return/return
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'===\w+\)return \w+;return (\w+)\}'
+    ),
+
+    # C2: reversed + ternary
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'===\w+\?\w+:(\w+)[};,)]'
+    ),
+
+    # ── D. Array.includes pattern ────────────────────────────────
+    # ["enabled","disabled","opt-in"].includes(Y)?Y:Zz
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'\]\.includes\(\w+\)\?\w+:(\w+)'
     ),
 ]
 
 
 def _find_default_var(data: bytes) -> str | None:
     """Try all strategies to find the auto mode default variable name."""
-    for i, pattern in enumerate(_STRATEGIES):
+    for pattern in _STRATEGIES:
         m = pattern.search(data)
         if m:
             var = m.group(1).decode()
@@ -98,6 +145,28 @@ def _already_patched(data: bytes) -> bool:
     if var is None:
         return False
     return (var.encode() + b'="enabled"; var') in data
+
+
+def _dump_opt_in_context(data: bytes):
+    """Print context around each 'opt-in' occurrence for debugging."""
+    for quote in [b'"', b"'"]:
+        needle = quote + b'opt-in' + quote
+        start = 0
+        idx = 0
+        while True:
+            pos = data.find(needle, start)
+            if pos == -1:
+                break
+            idx += 1
+            # Extract surrounding context (200 bytes before, 200 after)
+            ctx_start = max(0, pos - 200)
+            ctx_end = min(len(data), pos + len(needle) + 200)
+            ctx = data[ctx_start:ctx_end]
+            # Filter to printable ASCII for display
+            printable = bytes(b if 32 <= b < 127 else 46 for b in ctx)
+            print(f'  Context around {quote.decode()}opt-in{quote.decode()} #{idx} (offset {pos}):')
+            print(f'    ...{printable.decode()}...')
+            start = pos + 1
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +201,7 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
 
     if var_name is None:
         print("  [auto_mode_default] FAIL: could not locate auto mode default variable")
-        print("  Searched for 'opt-in' string context with return-default pattern")
+        print("  Searched for 'opt-in' string context with return-default or ternary pattern")
 
         # Debug: check if "opt-in" even exists in the binary
         opt_in_count = data.count(b'"opt-in"') + data.count(b"'opt-in'")
@@ -142,6 +211,9 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
 
         if opt_in_count == 0:
             print("  The JS source may be stored as bytecode on this platform.")
+        else:
+            print("  Dumping context around each 'opt-in' occurrence:")
+            _dump_opt_in_context(data)
 
         return False
 
@@ -166,7 +238,34 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
                     break
 
     if count == 0:
-        print(f"  [auto_mode_default] FAIL: declaration '{target.decode()}' not found in binary")
+        # Try semicolon followed by any identifier character
+        # e.g. VARNAME="disabled";function or VARNAME="disabled";if
+        for data_slice_len in range(len(data)):
+            # Just try finding "disabled" near the variable name
+            decl = var_bytes + b'="disabled"'
+            positions = []
+            start = 0
+            while True:
+                pos = data.find(decl, start)
+                if pos == -1:
+                    break
+                positions.append(pos)
+                start = pos + 1
+            if positions:
+                print(f"  [auto_mode_default] Found {len(positions)} '{decl.decode()}' occurrences")
+                for pos in positions[:3]:
+                    ctx = data[pos:pos+40]
+                    printable = bytes(b if 32 <= b < 127 else 46 for b in ctx)
+                    print(f"    offset {pos}: {printable.decode()}")
+                # Use raw replacement preserving whatever follows
+                target = var_bytes + b'="disabled"'
+                replacement = var_bytes + b'="enabled" '
+                assert len(target) == len(replacement)
+                count = data.count(target)
+            break  # only run once
+
+    if count == 0:
+        print(f"  [auto_mode_default] FAIL: declaration not found in binary")
         return False
 
     patched = data.replace(target, replacement)
