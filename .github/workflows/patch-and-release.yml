@@ -213,6 +213,7 @@ jobs:
       - name: Publish release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.patch.outputs.version }}
         run: |
           set -euo pipefail
@@ -276,5 +277,3 @@ jobs:
           Based on Claude Code \`${VERSION}\` from [GCS distribution](https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/).
           " \
             release/*
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
