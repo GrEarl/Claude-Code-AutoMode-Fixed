@@ -9,38 +9,93 @@ servers. This causes the auto mode circuit breaker to default to "disabled".
 This patch changes the default value from "disabled" to "enabled", allowing
 auto mode to work through proxy servers.
 
-Technical details:
-  The minified JS inside the compiled binary contains:
-      var hAM="disabled";
-  This is the default value for tengu_auto_mode_config.enabled, used when
-  GrowthBook remote evaluation fails or is skipped (no trust established).
+Strategy (robust against minifier renames):
+  1. Locate the parseAutoModeEnabledState function by its unique signature:
+       function XX(Y){if(Y==="enabled"||Y==="disabled"||Y==="opt-in")return Y;return ZZ}
+     The three string literals "enabled"/"disabled"/"opt-in" are application
+     constants that survive minification.
+  2. Extract the default-variable name (ZZ) from `return ZZ}`.
+  3. Find the declaration  ZZ="disabled";  and patch it to  ZZ="enabled";
+     with a 1-byte space pad to keep binary size identical.
 
-  Patch: hAM="disabled";var  ->  hAM="enabled"; var
-  (same 18 bytes — space inserted before 'var' to preserve alignment)
-
-  Effect: q3_(undefined) returns "enabled" instead of "disabled",
-  so the circuit breaker does NOT fire for proxy/non-Anthropic users.
-  Real Anthropic users are unaffected (their value comes from GrowthBook).
+Effect: when GrowthBook is unreachable (proxy users), q3_(undefined)
+returns "enabled" instead of "disabled", so the circuit breaker stays off.
+Real Anthropic users are unaffected (their value comes from GrowthBook).
 """
 
+import re
 import sys
 import os
 import hashlib
-
-PATCHES = [
-    {
-        "name": "auto_mode_default",
-        "description": "Change auto mode default from 'disabled' to 'enabled'",
-        "target": b'hAM="disabled";var',
-        "replacement": b'hAM="enabled"; var',
-        "min_occurrences": 1,
-    },
-]
 
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
+
+# ---------------------------------------------------------------------------
+# Core: find the default variable name dynamically, then build the patch pair
+# ---------------------------------------------------------------------------
+
+# The parseAutoModeEnabledState function checks for exactly these three
+# string values.  The surrounding function/variable names are minified,
+# but these literals are stable across builds.
+#
+# Matches:
+#   function Ab(c){if(c==="enabled"||c==="disabled"||c==="opt-in")return c;return Xy}
+#
+# Captures group(1) = default variable name (e.g. "Xy", "hAM", ...)
+
+_FUNC_RE = re.compile(
+    rb'function \w+\(\w+\)\{'
+    rb'if\(\w+===(?:"enabled"|\'enabled\')'
+    rb'\|\|\w+===(?:"disabled"|\'disabled\')'
+    rb'\|\|\w+===(?:"opt-in"|\'opt-in\')\)'
+    rb'return \w+;'
+    rb'return (\w+)'
+    rb'\}'
+)
+
+# After we know the variable name, the declaration looks like:
+#   ,VarName="disabled";var   or   ,VarName="disabled";let
+# We replace "disabled" (8 chars) with "enabled" (7 chars) + 1 space pad
+# to keep the same byte length.
+
+
+def _find_patch_pair(data: bytes):
+    """Return (target, replacement) bytes or None if pattern not found."""
+
+    m = _FUNC_RE.search(data)
+    if not m:
+        return None
+
+    var_name = m.group(1)  # e.g. b'hAM'
+
+    # Build the exact byte sequences
+    target = var_name + b'="disabled";var'
+    replacement = var_name + b'="enabled"; var'
+
+    # Sanity: lengths must match (8-char "disabled" -> 7-char "enabled" + 1 space)
+    assert len(target) == len(replacement), (
+        f"Length mismatch: {len(target)} vs {len(replacement)}"
+    )
+
+    return var_name.decode(), target, replacement
+
+
+def _already_patched(data: bytes) -> bool:
+    """Check if the binary is already patched (default = "enabled")."""
+    m = _FUNC_RE.search(data)
+    if not m:
+        return False
+    var_name = m.group(1)
+    patched_decl = var_name + b'="enabled"; var'
+    return patched_decl in data
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def patch_binary(input_path: str, output_path: str | None = None) -> bool:
     if output_path is None:
@@ -56,61 +111,42 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
     print(f"SHA256: {sha256(data)}")
     print()
 
-    patched = data
-    total_patched = 0
-    all_ok = True
-
-    for patch in PATCHES:
-        target = patch["target"]
-        replacement = patch["replacement"]
-
-        assert len(target) == len(replacement), (
-            f"Patch '{patch['name']}': length mismatch "
-            f"({len(target)} vs {len(replacement)})"
-        )
-
-        count = patched.count(target)
-        already = patched.count(replacement)
-
-        if count == 0 and already > 0:
-            print(f"  [{patch['name']}] Already patched ({already} occurrences)")
-            continue
-
-        if count == 0:
-            print(f"  [{patch['name']}] FAIL: pattern not found")
-            print(f"    Target: {target!r}")
-            all_ok = False
-            continue
-
-        if count < patch["min_occurrences"]:
-            print(
-                f"  [{patch['name']}] WARNING: expected >= {patch['min_occurrences']}, "
-                f"found {count}"
-            )
-
-        patched = patched.replace(target, replacement)
-        total_patched += count
-        print(f"  [{patch['name']}] OK - {count} occurrences patched")
-
-    if not all_ok:
-        print("\nERROR: Some patches failed. Binary format may have changed.")
-        return False
-
-    if patched == data:
-        print("\nNo changes needed (already patched)")
+    # Check already patched
+    if _already_patched(data):
+        print("  [auto_mode_default] Already patched")
         if output_path != input_path:
             with open(output_path, "wb") as f:
                 f.write(data)
+        print("\nNo changes needed")
         return True
 
+    # Find the patch target dynamically
+    result = _find_patch_pair(data)
+    if result is None:
+        print("  [auto_mode_default] FAIL: could not locate parseAutoModeEnabledState function")
+        print("  Looked for: function X(Y){if(Y===\"enabled\"||Y===\"disabled\"||Y===\"opt-in\")return Y;return Z}")
+        print("  The binary format may have changed significantly.")
+        return False
+
+    var_name, target, replacement = result
+    print(f"  [auto_mode_default] Found default variable: {var_name}")
+
+    count = data.count(target)
+    if count == 0:
+        print(f"  [auto_mode_default] FAIL: declaration '{target.decode()}' not found")
+        return False
+
+    patched = data.replace(target, replacement)
     assert len(patched) == len(data), f"Size changed: {len(data)} -> {len(patched)}"
+
+    print(f"  [auto_mode_default] OK - {count} occurrences patched")
+    print(f"    {target.decode()!r}  ->  {replacement.decode()!r}")
 
     with open(output_path, "wb") as f:
         f.write(patched)
 
     print(f"\nOutput: {output_path}")
     print(f"SHA256: {sha256(patched)}")
-    print(f"Total:  {total_patched} patches applied")
     return True
 
 

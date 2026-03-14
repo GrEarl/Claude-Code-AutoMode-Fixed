@@ -18,13 +18,12 @@ concurrency:
   group: patch-release
   cancel-in-progress: false
 
+env:
+  GCS_BUCKET: "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
+
 jobs:
-  # ── 1. Download all GCS binaries, patch, upload ─────────────────
-  patch:
+  patch-and-release:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.detect.outputs.version }}
-      should_release: ${{ steps.detect.outputs.should_release }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,21 +38,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          BUCKET="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
-          VERSION=$(curl -fsSL "$BUCKET/latest" | tr -d '\r\n')
-
+          VERSION=$(curl -fsSL "$GCS_BUCKET/latest" | tr -d '\r\n')
           if [ -z "$VERSION" ]; then
             echo "::error::Failed to read latest version"
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
-
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
           echo "Latest upstream version: $VERSION"
 
-          FORCE="${{ inputs.force || 'false' }}"
           TAG="v$VERSION"
+          FORCE="${{ inputs.force || 'false' }}"
 
           if [ "$FORCE" = "true" ]; then
             echo "Force rebuild requested"
@@ -70,34 +64,36 @@ jobs:
             echo "Release $TAG already exists - skipping"
             echo "should_release=false" >> "$GITHUB_OUTPUT"
           else
-            echo "New version detected - will build"
+            echo "New version $VERSION detected"
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download and patch all GCS binaries
+      - name: Download, patch, and release
         if: steps.detect.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          BUCKET="${{ steps.detect.outputs.bucket }}"
           VERSION="${{ steps.detect.outputs.version }}"
           mkdir -p dist
 
-          # Download manifest
-          curl -fsSL "$BUCKET/$VERSION/manifest.json" -o manifest.json
+          # ── Download manifest ──────────────────────────────────
+          curl -fsSL "$GCS_BUCKET/$VERSION/manifest.json" -o manifest.json
           echo "=== manifest.json ==="
           python3 -m json.tool manifest.json
 
-          # Extract platform list
-          PLATFORMS=$(python3 -c "
+          # ── Extract platform info (platform, binary name) ─────
+          # e.g.  "linux-x64 claude"  or  "win32-x64 claude.exe"
+          ENTRIES=$(python3 -c "
           import json
           with open('manifest.json') as f:
               m = json.load(f)
-          for p in m.get('platforms', {}):
-              print(p)
+          for p, info in m.get('platforms', {}).items():
+              print(p, info.get('binary', 'claude'))
           ")
 
-          # Map GCS platform names to release asset names
+          # ── Map GCS platform to release asset name ─────────────
           platform_to_asset() {
             case "$1" in
               linux-x64)        echo "claude-linux-x64" ;;
@@ -106,17 +102,25 @@ jobs:
               linux-arm64-musl) echo "claude-linux-arm64-musl" ;;
               darwin-x64)       echo "claude-macos-x64" ;;
               darwin-arm64)     echo "claude-macos-arm64" ;;
+              win32-x64)        echo "claude-windows-x64.exe" ;;
+              win32-arm64)      echo "claude-windows-arm64.exe" ;;
               *)                echo "claude-$1" ;;
             esac
           }
 
-          for PLATFORM in $PLATFORMS; do
-            ASSET=$(platform_to_asset "$PLATFORM")
-            echo ""
-            echo "=== $PLATFORM -> $ASSET ==="
+          # ── Download and patch each platform ───────────────────
+          PATCHED=0
+          FAILED=0
 
-            if ! curl -fsSL "$BUCKET/$VERSION/$PLATFORM/claude" -o "dist/$ASSET"; then
-              echo "  SKIP: download failed"
+          while IFS=' ' read -r PLATFORM BINARY_NAME; do
+            ASSET=$(platform_to_asset "$PLATFORM")
+            URL="$GCS_BUCKET/$VERSION/$PLATFORM/$BINARY_NAME"
+            echo ""
+            echo "=== $PLATFORM ($BINARY_NAME) -> $ASSET ==="
+
+            if ! curl -fsSL "$URL" -o "dist/$ASSET"; then
+              echo "  SKIP: download failed ($URL)"
+              FAILED=$((FAILED + 1))
               continue
             fi
 
@@ -127,153 +131,69 @@ jobs:
             if ! python3 scripts/patch_binary.py "dist/$ASSET"; then
               echo "  SKIP: patch failed"
               rm -f "dist/$ASSET"
+              FAILED=$((FAILED + 1))
               continue
             fi
-          done
+
+            PATCHED=$((PATCHED + 1))
+          done <<< "$ENTRIES"
 
           echo ""
-          echo "=== Patched artifacts ==="
+          echo "=== Results: $PATCHED patched, $FAILED failed ==="
           ls -lah dist/
 
-      - uses: actions/upload-artifact@v4
-        if: steps.detect.outputs.should_release == 'true'
-        with:
-          name: patched-unix
-          path: dist/
-          retention-days: 1
-
-  # ── 2. Windows binary (npm — GCS bucket has no Windows builds) ──
-  patch-windows:
-    needs: patch
-    if: needs.patch.outputs.should_release == 'true'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Claude Code
-        shell: bash
-        run: npm install -g @anthropic-ai/claude-code@${{ needs.patch.outputs.version }}
-
-      - name: Locate and patch binary
-        shell: bash
-        run: |
-          set -euo pipefail
-          PREFIX=$(npm prefix -g | tr '\\' '/')
-
-          BINARY=""
-          for p in \
-            "$PREFIX/claude.exe" \
-            "$PREFIX/node_modules/.bin/claude.exe" \
-            "$(which claude 2>/dev/null || true)" \
-          ; do
-            echo "  checking: $p"
-            if [ -f "$p" ]; then
-              BINARY="$p"
-              break
-            fi
-          done
-
-          if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
-            echo "::warning::Could not find claude.exe - listing prefix"
-            find "$PREFIX" -maxdepth 3 -name "claude*" 2>/dev/null || true
-            echo "::error::Windows binary not found"
+          if [ "$PATCHED" -eq 0 ]; then
+            echo "::error::No binaries were patched"
             exit 1
           fi
 
-          echo "Found binary: $BINARY ($(stat --format='%s' "$BINARY") bytes)"
-
-          mkdir -p dist
-          python scripts/patch_binary.py "$BINARY" dist/claude-windows-x64.exe
-          ls -la dist/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: patched-windows
-          path: dist/
-          retention-days: 1
-
-  # ── 3. Collect all artifacts → GitHub Release ───────────────────
-  release:
-    needs: [patch, patch-windows]
-    if: always() && needs.patch.outputs.should_release == 'true' && !cancelled()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Publish release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.patch.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p release
-
-          # Collect all artifacts
-          find artifacts -type f -exec cp {} release/ \;
-          echo "=== Release assets ==="
-          ls -lah release/
-
-          if [ -z "$(ls release/)" ]; then
-            echo "::error::No artifacts to release"
-            exit 1
-          fi
-
-          # Build file list for release notes
+          # ── Build release notes ────────────────────────────────
           FILE_TABLE=""
-          for f in release/*; do
+          for f in dist/*; do
             NAME=$(basename "$f")
             SIZE=$(stat --format='%s' "$f" | numfmt --to=iec-i --suffix=B)
             case "$NAME" in
-              *windows*)  PLATFORM="Windows x64" ;;
-              *linux-x64-musl) PLATFORM="Linux x64 (musl)" ;;
-              *linux-arm64-musl) PLATFORM="Linux ARM64 (musl)" ;;
-              *linux-x64) PLATFORM="Linux x64" ;;
-              *linux-arm64) PLATFORM="Linux ARM64" ;;
-              *macos-x64) PLATFORM="macOS x64 (Intel)" ;;
-              *macos-arm64) PLATFORM="macOS ARM64 (Apple Silicon)" ;;
-              *)          PLATFORM="$NAME" ;;
+              *windows-x64*)       PLABEL="Windows x64" ;;
+              *windows-arm64*)     PLABEL="Windows ARM64" ;;
+              *linux-x64-musl*)    PLABEL="Linux x64 (musl)" ;;
+              *linux-arm64-musl*)  PLABEL="Linux ARM64 (musl)" ;;
+              *linux-x64*)         PLABEL="Linux x64" ;;
+              *linux-arm64*)       PLABEL="Linux ARM64" ;;
+              *macos-x64*)         PLABEL="macOS x64 (Intel)" ;;
+              *macos-arm64*)       PLABEL="macOS ARM64 (Apple Silicon)" ;;
+              *)                   PLABEL="$NAME" ;;
             esac
-            FILE_TABLE="${FILE_TABLE}| ${PLATFORM} | \`${NAME}\` | ${SIZE} |
-          "
+            FILE_TABLE="$FILE_TABLE| $PLABEL | \`$NAME\` | $SIZE |"$'\n'
           done
 
-          # Delete existing release if force-rebuilt
+          # ── Publish GitHub release ─────────────────────────────
           gh release delete "v$VERSION" --yes 2>/dev/null || true
           git push --delete origin "v$VERSION" 2>/dev/null || true
 
-          gh release create "v$VERSION" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Claude Code v$VERSION (Auto Mode Enabled)" \
-            --notes "## Claude Code v${VERSION} - Auto Mode Patch
+          BODY=$(cat <<NOTES
+          ## Claude Code v${VERSION} - Auto Mode Patch
 
-          Patched Claude Code binaries with **Auto Mode** enabled by default.
+          Patched binaries with **Auto Mode** enabled by default.
 
           ### Patch
-          \`tengu_auto_mode_config\` default: \`\"disabled\"\` -> \`\"enabled\"\`
+          \`tengu_auto_mode_config\` default changed from \`"disabled"\` to \`"enabled"\`.
+          This allows \`/effort max\` (auto mode) to work through a proxy (\`ANTHROPIC_BASE_URL\`).
 
           ### Downloads
           | Platform | File | Size |
           |----------|------|------|
           ${FILE_TABLE}
+          ### Install
+          Download and replace your \`claude\` binary:
+          - **Windows** \`%USERPROFILE%\\.local\\bin\\claude.exe\`
+          - **Linux / macOS** \`~/.local/bin/claude\`
 
-          ### Installation
-          Download the binary for your platform and replace the existing \`claude\` binary:
-          - **Windows**: \`%USERPROFILE%\\.local\\bin\\claude.exe\`
-          - **Linux / macOS**: \`~/.local/bin/claude\`
+          Based on Claude Code \`${VERSION}\`.
+          NOTES
+          )
 
-          Then launch Claude Code and use \`/effort max\` for auto mode.
-
-          Based on Claude Code \`${VERSION}\` from [GCS distribution](https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/).
-          " \
-            release/*
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Claude Code v$VERSION (Auto Mode Enabled)" \
+            --notes "$BODY" \
+            dist/*
