@@ -7,20 +7,18 @@ the GrowthBook feature flag system cannot establish trust with Anthropic's
 servers. This causes the auto mode circuit breaker to default to "disabled".
 
 This patch changes the default value from "disabled" to "enabled", allowing
-auto mode to work through proxy servers.
+auto mode (claude --enable-auto-mode) to work through proxy servers.
 
-Strategy (robust against minifier renames):
-  1. Locate the parseAutoModeEnabledState function by its unique signature:
-       function XX(Y){if(Y==="enabled"||Y==="disabled"||Y==="opt-in")return Y;return ZZ}
-     The three string literals "enabled"/"disabled"/"opt-in" are application
-     constants that survive minification.
-  2. Extract the default-variable name (ZZ) from `return ZZ}`.
-  3. Find the declaration  ZZ="disabled";  and patch it to  ZZ="enabled";
-     with a 1-byte space pad to keep binary size identical.
+Strategy (robust against minifier renames and reordering):
+  1. Locate the parseAutoModeEnabledState function by searching for
+     the unique string literal "opt-in" (only used in auto mode context)
+     combined with the function's return-default pattern.
+  2. Extract the default-variable name from `return VARNAME}`.
+  3. Find the declaration  VARNAME="disabled";  and patch it to
+     VARNAME="enabled";  with a 1-byte space pad to keep binary size.
 
-Effect: when GrowthBook is unreachable (proxy users), q3_(undefined)
-returns "enabled" instead of "disabled", so the circuit breaker stays off.
-Real Anthropic users are unaffected (their value comes from GrowthBook).
+  Multiple regex strategies are tried in order to handle variations
+  across platforms (different comparison orders, different minifier output).
 """
 
 import re
@@ -34,63 +32,72 @@ def sha256(data: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Core: find the default variable name dynamically, then build the patch pair
+# Regex strategies (tried in order, first match wins)
 # ---------------------------------------------------------------------------
 
-# The parseAutoModeEnabledState function checks for exactly these three
-# string values.  The surrounding function/variable names are minified,
-# but these literals are stable across builds.
+# All strategies extract group(1) = the default variable name.
 #
-# Matches:
-#   function Ab(c){if(c==="enabled"||c==="disabled"||c==="opt-in")return c;return Xy}
-#
-# Captures group(1) = default variable name (e.g. "Xy", "hAM", ...)
+# The three string literals "enabled", "disabled", "opt-in" are application
+# constants that survive minification.  The variable/function names change
+# per-platform build.
 
-_FUNC_RE = re.compile(
-    rb'function \w+\(\w+\)\{'
-    rb'if\(\w+===(?:"enabled"|\'enabled\')'
-    rb'\|\|\w+===(?:"disabled"|\'disabled\')'
-    rb'\|\|\w+===(?:"opt-in"|\'opt-in\')\)'
-    rb'return \w+;'
-    rb'return (\w+)'
-    rb'\}'
-)
+_Q = rb'''(?:"|')'''  # quote (single or double)
 
-# After we know the variable name, the declaration looks like:
-#   ,VarName="disabled";var   or   ,VarName="disabled";let
-# We replace "disabled" (8 chars) with "enabled" (7 chars) + 1 space pad
-# to keep the same byte length.
+_STRATEGIES = [
+    # ── Strategy 1: full function, standard order ────────────────
+    # function Xx(Y){if(Y==="enabled"||Y==="disabled"||Y==="opt-in")return Y;return Zz}
+    re.compile(
+        rb'function \w+\(\w+\)\{'
+        rb'if\(\w+===' + _Q + rb'enabled' + _Q
+        + rb'\|\|\w+===' + _Q + rb'disabled' + _Q
+        + rb'\|\|\w+===' + _Q + rb'opt-in' + _Q
+        + rb'\)return \w+;return (\w+)\}'
+    ),
+
+    # ── Strategy 2: any order — just anchor on "opt-in" at end ───
+    # ...||Y==="opt-in")return Y;return Zz}
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'\)return \w+;return (\w+)\}'
+    ),
+
+    # ── Strategy 3: "opt-in" in the middle ───────────────────────
+    # ...||Y==="opt-in"||...  )return Y;return Zz}
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,120}return \w+;return (\w+)\}'
+    ),
+
+    # ── Strategy 4: "opt-in" at the start ────────────────────────
+    # if(Y==="opt-in"||...)return Y;return Zz}
+    re.compile(
+        rb'if\(\w+===' + _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,200}return \w+;return (\w+)\}'
+    ),
+
+    # ── Strategy 5: very loose — "opt-in" near a double-return ───
+    # Looks for "opt-in" within 300 bytes before `return X;return Y}`
+    re.compile(
+        _Q + rb'opt-in' + _Q + rb'[^}]{0,300}return \w+;return (\w+)\}'
+    ),
+]
 
 
-def _find_patch_pair(data: bytes):
-    """Return (target, replacement) bytes or None if pattern not found."""
-
-    m = _FUNC_RE.search(data)
-    if not m:
-        return None
-
-    var_name = m.group(1)  # e.g. b'hAM'
-
-    # Build the exact byte sequences
-    target = var_name + b'="disabled";var'
-    replacement = var_name + b'="enabled"; var'
-
-    # Sanity: lengths must match (8-char "disabled" -> 7-char "enabled" + 1 space)
-    assert len(target) == len(replacement), (
-        f"Length mismatch: {len(target)} vs {len(replacement)}"
-    )
-
-    return var_name.decode(), target, replacement
+def _find_default_var(data: bytes) -> str | None:
+    """Try all strategies to find the auto mode default variable name."""
+    for i, pattern in enumerate(_STRATEGIES):
+        m = pattern.search(data)
+        if m:
+            var = m.group(1).decode()
+            # Sanity: variable name should be short (minified)
+            if len(var) <= 10:
+                return var
+    return None
 
 
 def _already_patched(data: bytes) -> bool:
     """Check if the binary is already patched (default = "enabled")."""
-    m = _FUNC_RE.search(data)
-    if not m:
+    var = _find_default_var(data)
+    if var is None:
         return False
-    var_name = m.group(1)
-    patched_decl = var_name + b'="enabled"; var'
-    return patched_decl in data
+    return (var.encode() + b'="enabled"; var') in data
 
 
 # ---------------------------------------------------------------------------
@@ -120,20 +127,46 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
         print("\nNo changes needed")
         return True
 
-    # Find the patch target dynamically
-    result = _find_patch_pair(data)
-    if result is None:
-        print("  [auto_mode_default] FAIL: could not locate parseAutoModeEnabledState function")
-        print("  Looked for: function X(Y){if(Y===\"enabled\"||Y===\"disabled\"||Y===\"opt-in\")return Y;return Z}")
-        print("  The binary format may have changed significantly.")
+    # Find the default variable
+    var_name = _find_default_var(data)
+
+    if var_name is None:
+        print("  [auto_mode_default] FAIL: could not locate auto mode default variable")
+        print("  Searched for 'opt-in' string context with return-default pattern")
+
+        # Debug: check if "opt-in" even exists in the binary
+        opt_in_count = data.count(b'"opt-in"') + data.count(b"'opt-in'")
+        disabled_count = data.count(b'"disabled"')
+        print(f'  Debug: "opt-in" occurrences = {opt_in_count}')
+        print(f'  Debug: "disabled" occurrences = {disabled_count}')
+
+        if opt_in_count == 0:
+            print("  The JS source may be stored as bytecode on this platform.")
+
         return False
 
-    var_name, target, replacement = result
     print(f"  [auto_mode_default] Found default variable: {var_name}")
+
+    var_bytes = var_name.encode()
+    target = var_bytes + b'="disabled";var'
+    replacement = var_bytes + b'="enabled"; var'
+
+    assert len(target) == len(replacement)
 
     count = data.count(target)
     if count == 0:
-        print(f"  [auto_mode_default] FAIL: declaration '{target.decode()}' not found")
+        # Try with 'let' or 'const' instead of 'var'
+        for kw in [b'let', b'const']:
+            alt_target = var_bytes + b'="disabled";' + kw
+            alt_replacement = var_bytes + b'="enabled"; ' + kw
+            if len(alt_target) == len(alt_replacement):
+                alt_count = data.count(alt_target)
+                if alt_count > 0:
+                    target, replacement, count = alt_target, alt_replacement, alt_count
+                    break
+
+    if count == 0:
+        print(f"  [auto_mode_default] FAIL: declaration '{target.decode()}' not found in binary")
         return False
 
     patched = data.replace(target, replacement)

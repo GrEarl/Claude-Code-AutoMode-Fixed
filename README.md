@@ -1,7 +1,7 @@
 # Claude Code - Auto Mode Fixed
 
-Automated patcher that enables **Auto Mode** (`/effort max`) in Claude Code
-for users running through a proxy (`ANTHROPIC_BASE_URL`).
+Automated patcher that enables **Auto Mode** (`claude --enable-auto-mode`) in
+Claude Code for users running through a proxy (`ANTHROPIC_BASE_URL`).
 
 A GitHub Actions workflow checks for new Claude Code releases every 6 hours,
 patches the binaries for **all platforms**, and publishes them as a GitHub Release.
@@ -25,19 +25,24 @@ This repo patches that default from `"disabled"` to `"enabled"`.
 
 ## How the patch works
 
-Inside the compiled binary, the minified JS contains:
+Inside the compiled binary, the minified JS contains a function
+`parseAutoModeEnabledState` that validates the feature flag value:
 
-```
-var hAM="disabled";     // default auto-mode state
-```
-
-The patcher replaces it (same byte length) with:
-
-```
-var hAM="enabled";      // space-padded to keep alignment
+```js
+function XX(Y) {
+  if (Y === "enabled" || Y === "disabled" || Y === "opt-in") return Y;
+  return DEFAULT_VAR;  // DEFAULT_VAR = "disabled"
+}
 ```
 
-When GrowthBook skips the fetch (no trust), `q3_(undefined)` now returns
+The patcher locates `DEFAULT_VAR` by anchoring on the unique `"opt-in"`
+string literal, then replaces the declaration (same byte length):
+
+```
+VARNAME="disabled";var  ->  VARNAME="enabled"; var
+```
+
+When GrowthBook skips the fetch (no trust), the function now returns
 `"enabled"` instead of `"disabled"`, and the circuit breaker stays off.
 
 Real Anthropic users are unaffected -- their value comes from the live
@@ -71,7 +76,11 @@ chmod +x ~/.local/bin/claude
 copy claude-windows-x64.exe %USERPROFILE%\.local\bin\claude.exe
 ```
 
-Then launch Claude Code and use `/effort max`.
+Then launch Claude Code with auto mode:
+
+```bash
+claude --enable-auto-mode
+```
 
 ## Manual patching
 

@@ -173,11 +173,11 @@ jobs:
           BODY=$(cat <<NOTES
           ## Claude Code v${VERSION} - Auto Mode Patch
 
-          Patched binaries with **Auto Mode** enabled by default.
+          Patched binaries with **Auto Mode** (`claude --enable-auto-mode`) enabled by default.
 
           ### Patch
           \`tengu_auto_mode_config\` default changed from \`"disabled"\` to \`"enabled"\`.
-          This allows \`/effort max\` (auto mode) to work through a proxy (\`ANTHROPIC_BASE_URL\`).
+          This allows \`claude --enable-auto-mode\` to work through a proxy (\`ANTHROPIC_BASE_URL\`).
 
           ### Downloads
           | Platform | File | Size |
