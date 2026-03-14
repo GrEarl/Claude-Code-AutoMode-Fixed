@@ -17,9 +17,18 @@ Strategy (robust against minifier renames and reordering):
   3. Find the declaration  VARNAME="disabled";  and patch it to
      VARNAME="enabled";  with a 1-byte space pad to keep binary size.
 
-  Multiple regex strategies are tried in order to handle variations
-  across platforms (different comparison orders, ternary vs if/return,
-  different minifier output).
+Known variable names per platform (v2.1.76):
+  darwin-arm64:     cT$    (contains $)
+  darwin-x64:       FA9
+  linux-arm64:      N_R
+  linux-arm64-musl: N_R
+  linux-x64:        v$_    (contains $)
+  linux-x64-musl:   v$_    (contains $)
+  win32-x64:        hAM
+  win32-arm64:      Vq5
+
+IMPORTANT: JS identifiers can contain $ (e.g. cT$, v$_).
+All regex patterns use [\\w$]+ instead of \\w+ to match these.
 """
 
 import re
@@ -40,89 +49,76 @@ def sha256(data: bytes) -> str:
 #
 # The three string literals "enabled", "disabled", "opt-in" are application
 # constants that survive minification.  The variable/function names change
-# per-platform build.
+# per-platform build and may contain $ (valid JS identifier character).
 #
-# Two function forms exist across platforms:
-#   A) if/return/return:  if(...)return Y;return DEFAULT}
-#   B) ternary:           ...?Y:DEFAULT}  or  return ...?Y:DEFAULT
+# Verified function forms from binary analysis (v2.1.76):
+#
+#   parseAutoModeEnabledState (the one we patch):
+#     function hD9(_){if(_==="enabled"||_==="disabled"||_==="opt-in")return _;return cT$}
+#     function Iw8(H){if(H==="enabled"||H==="disabled"||H==="opt-in")return H;return v$_}
+#
+#   A different function (returns void 0, NOT a variable -- we skip this):
+#     return _==="enabled"||_==="disabled"||_==="opt-in"?_:void 0
 
-_Q = rb'''(?:"|')'''  # quote (single or double)
+_Q = rb'''(?:"|')'''       # quote (single or double)
+_ID = rb'[\w$]+'           # JS identifier (includes $ character)
 
 _STRATEGIES = [
     # ── A. if/return/return patterns ─────────────────────────────
+    # Verified: all 8 platforms use this form for parseAutoModeEnabledState
 
-    # A1: full function, standard order
-    # function Xx(Y){if(Y==="enabled"||Y==="disabled"||Y==="opt-in")return Y;return Zz}
+    # A1: full function, standard order (enabled||disabled||opt-in)
     re.compile(
-        rb'function \w+\(\w+\)\{'
-        rb'if\(\w+===' + _Q + rb'enabled' + _Q
-        + rb'\|\|\w+===' + _Q + rb'disabled' + _Q
-        + rb'\|\|\w+===' + _Q + rb'opt-in' + _Q
-        + rb'\)return \w+;return (\w+)\}'
+        rb'function ' + _ID + rb'\(' + _ID + rb'\)\{'
+        rb'if\(' + _ID + rb'===' + _Q + rb'enabled' + _Q
+        + rb'\|\|' + _ID + rb'===' + _Q + rb'disabled' + _Q
+        + rb'\|\|' + _ID + rb'===' + _Q + rb'opt-in' + _Q
+        + rb'\)return ' + _ID + rb';return (' + _ID + rb')\}'
     ),
 
-    # A2: "opt-in" at end of comparisons
+    # A2: "opt-in" at end of comparisons (any order before it)
     re.compile(
-        _Q + rb'opt-in' + _Q + rb'\)return \w+;return (\w+)\}'
+        _Q + rb'opt-in' + _Q + rb'\)return ' + _ID + rb';return (' + _ID + rb')\}'
     ),
 
     # A3: "opt-in" in middle
     re.compile(
-        _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,120}return \w+;return (\w+)\}'
+        _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,120}return ' + _ID + rb';return (' + _ID + rb')\}'
     ),
 
     # A4: "opt-in" at start
     re.compile(
-        rb'if\(\w+===' + _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,200}return \w+;return (\w+)\}'
+        rb'if\(' + _ID + rb'===' + _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,200}return ' + _ID + rb';return (' + _ID + rb')\}'
     ),
 
     # A5: loose - "opt-in" within 300 bytes of double-return
     re.compile(
-        _Q + rb'opt-in' + _Q + rb'[^}]{0,300}return \w+;return (\w+)\}'
+        _Q + rb'opt-in' + _Q + rb'[^}]{0,300}return ' + _ID + rb';return (' + _ID + rb')\}'
     ),
 
-    # ── B. Ternary patterns ──────────────────────────────────────
-    # These match when minifier uses  ...?Y:DEFAULT  instead of
-    # if(...)return Y;return DEFAULT
+    # ── B. Ternary patterns (fallback) ───────────────────────────
+    # Not seen in v2.1.76 for parseAutoModeEnabledState, but kept
+    # as defense against future minifier changes.
+    # NOTE: skips "void 0" (not a variable) since _ID requires [\w$]+
 
-    # B1: "opt-in" at end of comparisons, ternary
-    # ...||Y==="opt-in"?Y:Zz}   or   ...||Y==="opt-in"?Y:Zz;
+    # B1: "opt-in" at end, ternary
     re.compile(
-        _Q + rb'opt-in' + _Q + rb'\?\w+:(\w+)[};,)]'
+        _Q + rb'opt-in' + _Q + rb'\?' + _ID + rb':(' + _ID + rb')[};,)]'
     ),
 
     # B2: "opt-in" in middle, ternary
     re.compile(
-        _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,120}\?\w+:(\w+)[};,)]'
+        _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,120}\?' + _ID + rb':(' + _ID + rb')[};,)]'
     ),
 
-    # B3: "opt-in" at start, ternary
+    # B3: reversed comparison + if/return/return
     re.compile(
-        rb'\w+===' + _Q + rb'opt-in' + _Q + rb'\|\|[^}]{0,200}\?\w+:(\w+)[};,)]'
+        _Q + rb'opt-in' + _Q + rb'===' + _ID + rb'\)return ' + _ID + rb';return (' + _ID + rb')\}'
     ),
 
-    # B4: loose - "opt-in" within 300 bytes of ternary
+    # B4: reversed comparison + ternary
     re.compile(
-        _Q + rb'opt-in' + _Q + rb'[^}]{0,300}\?\w+:(\w+)\}'
-    ),
-
-    # ── C. Reversed comparison patterns ──────────────────────────
-    # "opt-in"===Y  (value on left side of ===)
-
-    # C1: reversed + if/return/return
-    re.compile(
-        _Q + rb'opt-in' + _Q + rb'===\w+\)return \w+;return (\w+)\}'
-    ),
-
-    # C2: reversed + ternary
-    re.compile(
-        _Q + rb'opt-in' + _Q + rb'===\w+\?\w+:(\w+)[};,)]'
-    ),
-
-    # ── D. Array.includes pattern ────────────────────────────────
-    # ["enabled","disabled","opt-in"].includes(Y)?Y:Zz
-    re.compile(
-        _Q + rb'opt-in' + _Q + rb'\]\.includes\(\w+\)\?\w+:(\w+)'
+        _Q + rb'opt-in' + _Q + rb'===' + _ID + rb'\?' + _ID + rb':(' + _ID + rb')[};,)]'
     ),
 ]
 
@@ -144,7 +140,13 @@ def _already_patched(data: bytes) -> bool:
     var = _find_default_var(data)
     if var is None:
         return False
-    return (var.encode() + b'="enabled"; var') in data
+    vb = var.encode()
+    # Check all keyword variants
+    return (
+        (vb + b'="enabled"; var') in data
+        or (vb + b'="enabled"; let') in data
+        or (vb + b'="enabled"; const') in data
+    )
 
 
 def _dump_opt_in_context(data: bytes):
@@ -158,11 +160,9 @@ def _dump_opt_in_context(data: bytes):
             if pos == -1:
                 break
             idx += 1
-            # Extract surrounding context (200 bytes before, 200 after)
             ctx_start = max(0, pos - 200)
             ctx_end = min(len(data), pos + len(needle) + 200)
             ctx = data[ctx_start:ctx_end]
-            # Filter to printable ASCII for display
             printable = bytes(b if 32 <= b < 127 else 46 for b in ctx)
             print(f'  Context around {quote.decode()}opt-in{quote.decode()} #{idx} (offset {pos}):')
             print(f'    ...{printable.decode()}...')
@@ -201,9 +201,8 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
 
     if var_name is None:
         print("  [auto_mode_default] FAIL: could not locate auto mode default variable")
-        print("  Searched for 'opt-in' string context with return-default or ternary pattern")
+        print("  Searched for 'opt-in' string context with return-default pattern")
 
-        # Debug: check if "opt-in" even exists in the binary
         opt_in_count = data.count(b'"opt-in"') + data.count(b"'opt-in'")
         disabled_count = data.count(b'"disabled"')
         print(f'  Debug: "opt-in" occurrences = {opt_in_count}')
@@ -220,52 +219,42 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
     print(f"  [auto_mode_default] Found default variable: {var_name}")
 
     var_bytes = var_name.encode()
-    target = var_bytes + b'="disabled";var'
-    replacement = var_bytes + b'="enabled"; var'
 
-    assert len(target) == len(replacement)
+    # Try declaration with var, let, const keywords
+    target = None
+    replacement = None
+    count = 0
 
-    count = data.count(target)
-    if count == 0:
-        # Try with 'let' or 'const' instead of 'var'
-        for kw in [b'let', b'const']:
-            alt_target = var_bytes + b'="disabled";' + kw
-            alt_replacement = var_bytes + b'="enabled"; ' + kw
-            if len(alt_target) == len(alt_replacement):
-                alt_count = data.count(alt_target)
-                if alt_count > 0:
-                    target, replacement, count = alt_target, alt_replacement, alt_count
-                    break
+    for kw in [b'var', b'let', b'const']:
+        t = var_bytes + b'="disabled";' + kw
+        r = var_bytes + b'="enabled"; ' + kw
+        assert len(t) == len(r), f"Length mismatch for {kw}: {len(t)} vs {len(r)}"
+        c = data.count(t)
+        if c > 0:
+            target, replacement, count = t, r, c
+            break
 
     if count == 0:
-        # Try semicolon followed by any identifier character
-        # e.g. VARNAME="disabled";function or VARNAME="disabled";if
-        for data_slice_len in range(len(data)):
-            # Just try finding "disabled" near the variable name
-            decl = var_bytes + b'="disabled"'
-            positions = []
-            start = 0
-            while True:
-                pos = data.find(decl, start)
-                if pos == -1:
-                    break
-                positions.append(pos)
-                start = pos + 1
-            if positions:
-                print(f"  [auto_mode_default] Found {len(positions)} '{decl.decode()}' occurrences")
-                for pos in positions[:3]:
-                    ctx = data[pos:pos+40]
-                    printable = bytes(b if 32 <= b < 127 else 46 for b in ctx)
-                    print(f"    offset {pos}: {printable.decode()}")
-                # Use raw replacement preserving whatever follows
-                target = var_bytes + b'="disabled"'
-                replacement = var_bytes + b'="enabled" '
-                assert len(target) == len(replacement)
-                count = data.count(target)
-            break  # only run once
+        # Debug: show what's near the variable declaration
+        decl = var_bytes + b'="disabled"'
+        positions = []
+        start = 0
+        while True:
+            pos = data.find(decl, start)
+            if pos == -1:
+                break
+            positions.append(pos)
+            start = pos + 1
 
-    if count == 0:
-        print(f"  [auto_mode_default] FAIL: declaration not found in binary")
+        if positions:
+            print(f"  [auto_mode_default] Found {len(positions)} '{decl.decode()}' but no known keyword after semicolon")
+            for pos in positions[:5]:
+                ctx = data[pos:pos + 50]
+                printable = bytes(b if 32 <= b < 127 else 46 for b in ctx)
+                print(f"    offset {pos}: {printable.decode()}")
+        else:
+            print(f"  [auto_mode_default] FAIL: '{decl.decode()}' not found anywhere in binary")
+
         return False
 
     patched = data.replace(target, replacement)
