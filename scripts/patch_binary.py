@@ -140,13 +140,8 @@ def _already_patched(data: bytes) -> bool:
     var = _find_default_var(data)
     if var is None:
         return False
-    vb = var.encode()
-    # Check all keyword variants
-    return (
-        (vb + b'="enabled"; var') in data
-        or (vb + b'="enabled"; let') in data
-        or (vb + b'="enabled"; const') in data
-    )
+    # The patched form is VARNAME="enabled" followed by ; or , (space-padded)
+    return (var.encode() + b'="enabled" ') in data
 
 
 def _dump_opt_in_context(data: bytes):
@@ -220,9 +215,9 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
 
     var_bytes = var_name.encode()
 
-    # Try declaration with var, let, const keywords
-    target = None
-    replacement = None
+    # Try declaration with var, let, const keywords (v2.1.76 pattern)
+    target = var_bytes + b'="disabled"'
+    replacement = var_bytes + b'="enabled" '
     count = 0
 
     for kw in [b'var', b'let', b'const']:
@@ -235,27 +230,18 @@ def patch_binary(input_path: str, output_path: str | None = None) -> bool:
             break
 
     if count == 0:
-        # Debug: show what's near the variable declaration
-        decl = var_bytes + b'="disabled"'
-        positions = []
-        start = 0
-        while True:
-            pos = data.find(decl, start)
-            if pos == -1:
-                break
-            positions.append(pos)
-            start = pos + 1
+        # Fallback: replace just VARNAME="disabled" with VARNAME="enabled"
+        # (space-padded to same byte length). Works regardless of what follows
+        # the value -- semicolon (;var), comma (,NEXT;var), etc.
+        #
+        # v2.1.76: hAM="disabled";var   -> hAM="enabled"; var  (semicolon)
+        # v2.1.81: VAM="disabled",Uj_;  -> VAM="enabled" ,Uj_; (comma)
+        assert len(target) == len(replacement)
+        count = data.count(target)
 
-        if positions:
-            print(f"  [auto_mode_default] Found {len(positions)} '{decl.decode()}' but no known keyword after semicolon")
-            for pos in positions[:5]:
-                ctx = data[pos:pos + 50]
-                printable = bytes(b if 32 <= b < 127 else 46 for b in ctx)
-                print(f"    offset {pos}: {printable.decode()}")
-        else:
-            print(f"  [auto_mode_default] FAIL: '{decl.decode()}' not found anywhere in binary")
-
-        return False
+        if count == 0:
+            print(f"  [auto_mode_default] FAIL: '{target.decode()}' not found anywhere in binary")
+            return False
 
     patched = data.replace(target, replacement)
     assert len(patched) == len(data), f"Size changed: {len(data)} -> {len(patched)}"
